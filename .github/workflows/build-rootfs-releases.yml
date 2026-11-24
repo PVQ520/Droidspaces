@@ -1,0 +1,135 @@
+name: Build and Release Droidspaces RootFS
+
+# Only aarch64 Minimal/Base templates are built here.
+# paths-ignore stops the automated rootfs.json commit (pushed by the release job)
+# from re-triggering a full rebuild - without it every release loops forever.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'rootfs.json'
+      - '**.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      update_json_only:
+        description: 'Only regenerate rootfs.json from the latest release (skip build & release)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 0 * * 0'
+
+concurrency:
+  group: rootfs-release
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    if: ${{ github.event.inputs.update_json_only != 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      build_id: ${{ steps.prep.outputs.build_id }}
+      build_date: ${{ steps.prep.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint template labels
+        run: python3 scripts/generate_rootfs_json.py --lint
+
+      - name: Build matrix from templates/<arch>/*.Dockerfile
+        id: matrix
+        run: |
+          MATRIX=$(find templates -mindepth 2 -name '*.Dockerfile' | sed 's|^\./||; s|^templates/||' | sort \
+            | jq -R -s -c --slurpfile archs archs.json '
+                split("\n")[:-1]
+                | map(capture("^(?<arch>[^/]+)/(?<name>.+)\\.Dockerfile$"))
+                | map(. + $archs[0][.arch])
+                | {include: .}')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "$MATRIX" | jq .
+
+      - name: Prepare build metadata
+        id: prep
+        run: |
+          echo "build_date=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+          echo "build_id=v$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: setup
+    name: ${{ matrix.arch }}/${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build rootfs
+        run: ./build.sh -a "${{ matrix.arch }}" -i "${{ matrix.name }}" -v "${{ needs.setup.outputs.build_id }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-${{ matrix.name }}
+          path: "*.tar.xz"
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.setup.outputs.build_id }}
+          name: "Droidspaces RootFS ${{ needs.setup.outputs.build_id }}"
+          files: "*.tar.xz"
+          body: |
+            Automated Droidspaces RootFS build (aarch64 Minimal + Base)
+            Built on: ${{ needs.setup.outputs.build_date }}
+            Build ID: ${{ needs.setup.outputs.build_id }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Regenerate and push rootfs.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/generate_rootfs_json.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rootfs.json
+          git diff --cached --quiet && { echo "rootfs.json unchanged"; exit 0; }
+          git commit -m "chore: update rootfs.json for release ${{ needs.setup.outputs.build_id }}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+  update-json:
+    if: ${{ github.event.inputs.update_json_only == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate and push rootfs.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/generate_rootfs_json.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rootfs.json
+          git diff --cached --quiet && { echo "rootfs.json unchanged"; exit 0; }
+          git commit -m "chore: update rootfs.json"
+          git pull --rebase origin main
+          git push origin HEAD:main
